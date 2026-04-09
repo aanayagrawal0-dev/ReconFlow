@@ -1,3 +1,4 @@
 supabase
 requests
 boto3
+openai

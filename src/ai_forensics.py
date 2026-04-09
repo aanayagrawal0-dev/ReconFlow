@@ -1,115 +1,117 @@
-"""Gemini REST integration for discrepancy analysis."""
+"""OpenAI-powered discrepancy analysis for payment reconciliation."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-import requests
+from openai import OpenAI
 
 LOGGER = logging.getLogger(__name__)
 
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
 SYSTEM_PROMPT = (
-    "You are a Financial Integrity Agent. Analyze the internal order and gateway "
-    "event. Detect discrepancies in taxes, currency, or fraud. Return ONLY a raw "
-    "JSON object with keys: `discrepancy_type`, `explanation`, and "
-    "`suggested_action`."
+    "You are a financial audit assistant. Analyze payment discrepancies with "
+    "currency consistency treated as a high-priority alert. Return ONLY a raw "
+    "JSON object with keys: discrepancy_type, explanation, suggested_action."
 )
 
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+_CLIENT: OpenAI | None = None
 
 
-def analyze_discrepancy(internal_order: dict[str, Any], gateway_event: dict[str, Any]) -> dict[str, Any]:
-    """Ask Gemini to explain why a payment event does not reconcile cleanly.
+def analyze_discrepancy(
+    internal_order: dict[str, Any],
+    gateway_event: dict[str, Any],
+) -> dict[str, Any]:
+    """Generate a short forensic assessment for a mismatched payment event."""
 
-    The REST API is used intentionally to keep the deployment artifact small.
-    The function validates and normalizes the model response so the reconciliation
-    engine always receives a predictable dictionary shape.
-    """
+    client = _get_openai_client()
+    model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
 
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY must be configured in the environment.")
+    order_amount = _safe_decimal(internal_order.get("amount"))
+    gateway_amount = _safe_decimal(gateway_event.get("amount_captured"))
+    discrepancy = None
+    if order_amount is not None and gateway_amount is not None:
+        discrepancy = abs(order_amount - gateway_amount)
 
-    model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={api_key}"
+    prompt = (
+        "Analyze this payment discrepancy.\n"
+        f"- Internal Order Amount: {order_amount if order_amount is not None else internal_order.get('amount')} "
+        f"{internal_order.get('currency')}\n"
+        f"- Gateway Transaction Amount: {gateway_amount if gateway_amount is not None else gateway_event.get('amount_captured')} "
+        f"{gateway_event.get('currency')}\n"
+        f"- Order Reference: {internal_order.get('order_reference')}\n"
+        f"- Provider Transaction ID: {gateway_event.get('provider_txn_id')}\n"
+        f"- Discrepancy: {discrepancy if discrepancy is not None else 'UNKNOWN'}\n\n"
+        "Check currency consistency first. If the currencies differ, treat that as a "
+        "high-priority alert. Otherwise explain whether the discrepancy could be caused "
+        "by tax, gateway fees, rounding, orphaned payment, or fraud review. Keep it "
+        "professional and concise."
     )
 
-    user_payload = {
-        "internal_order": internal_order,
-        "gateway_event": gateway_event,
-    }
-
-    request_payload = {
-        "systemInstruction": {
-            "parts": [{"text": SYSTEM_PROMPT}],
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": json.dumps(user_payload, default=str),
-                    }
-                ],
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.1,
-            "responseMimeType": "application/json",
-        },
-    }
-
     try:
-        response = requests.post(url, json=request_payload, timeout=20)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        LOGGER.exception("Gemini REST request failed.")
-        raise RuntimeError("Failed to call Gemini REST API.") from exc
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=150,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:  # noqa: BLE001 - SDK raises multiple exception types.
+        LOGGER.exception("OpenAI API error while generating forensic report.")
+        return {
+            "discrepancy_type": "AI_ERROR",
+            "explanation": "Audit Error: Could not generate AI report. Manual review required.",
+            "suggested_action": "MANUAL_REVIEW",
+        }
 
-    response_json = response.json()
-    model_text = _extract_response_text(response_json)
-    parsed = _parse_json_object(model_text)
+    content = response.choices[0].message.content or ""
+    parsed = _parse_json_object(content)
 
-    # Normalize the shape so downstream writes to audit_logs are predictable.
     return {
         "discrepancy_type": str(parsed.get("discrepancy_type", "UNKNOWN")),
-        "explanation": str(parsed.get("explanation", "No explanation returned by Gemini.")),
+        "explanation": str(
+            parsed.get(
+                "explanation",
+                "Mismatch detected. Manual review required.",
+            )
+        ),
         "suggested_action": str(parsed.get("suggested_action", "MANUAL_REVIEW")),
     }
 
 
-def _extract_response_text(response_json: dict[str, Any]) -> str:
-    """Extract the primary text block from Gemini's REST response."""
+def _get_openai_client() -> OpenAI:
+    global _CLIENT
 
-    candidates = response_json.get("candidates") or []
-    if not candidates:
-        raise RuntimeError(f"Gemini response did not include candidates: {response_json}")
+    if _CLIENT is not None:
+        return _CLIENT
 
-    first_candidate = candidates[0]
-    content = first_candidate.get("content") or {}
-    parts = content.get("parts") or []
-    if not parts:
-        raise RuntimeError(f"Gemini response did not include content parts: {response_json}")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY must be configured in the environment.")
 
-    text = parts[0].get("text")
-    if not text:
-        raise RuntimeError(f"Gemini response did not include text content: {response_json}")
+    _CLIENT = OpenAI(api_key=api_key)
+    return _CLIENT
 
-    return text.strip()
+
+def _safe_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
 
 
 def _parse_json_object(raw_text: str) -> dict[str, Any]:
-    """Parse a JSON object even if the model wraps it in markdown fences.
-
-    Models occasionally surround JSON with ```json fences despite being told not
-    to. This helper strips common wrappers and then locates the outermost object.
-    """
-
     cleaned = raw_text.strip()
 
     if cleaned.startswith("```"):
@@ -119,22 +121,20 @@ def _parse_json_object(raw_text: str) -> dict[str, Any]:
 
     try:
         parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
     except json.JSONDecodeError:
-        pass
-
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise RuntimeError(f"Gemini response was not valid JSON: {raw_text}")
-
-    try:
-        parsed = json.loads(cleaned[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Gemini response contained malformed JSON: {raw_text}") from exc
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            LOGGER.error("OpenAI response was not valid JSON: %s", raw_text)
+            return {}
+        try:
+            parsed = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError:
+            LOGGER.error("OpenAI response contained malformed JSON: %s", raw_text)
+            return {}
 
     if not isinstance(parsed, dict):
-        raise RuntimeError(f"Gemini response JSON was not an object: {raw_text}")
+        LOGGER.error("OpenAI response JSON was not an object: %s", raw_text)
+        return {}
 
     return parsed

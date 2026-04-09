@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - supports Lambda packaging styles.
     from supabase_client import get_supabase_client, run_with_retry
 
 LOGGER = logging.getLogger(__name__)
+RECONCILIATION_TOLERANCE = Decimal("0.01")
 
 
 def process_transaction(event_body: dict[str, Any]) -> dict[str, Any]:
@@ -68,7 +69,8 @@ def process_transaction(event_body: dict[str, Any]) -> dict[str, Any]:
     if order_record:
         order_amount = _to_decimal(order_record.get("amount"), field_name="orders.amount")
         order_currency = _require_string(order_record, "currency").upper()
-        amounts_match = order_amount == captured_amount
+        amount_delta = abs(order_amount - captured_amount)
+        amounts_match = amount_delta <= RECONCILIATION_TOLERANCE
         currencies_match = order_currency == event_currency
 
     is_reconciled = bool(order_record and amounts_match and currencies_match)
