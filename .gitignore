@@ -1,2 +1,12 @@
 __pycache__/
 *.pyc
+
+# Local build artifacts (Lambda bundles/layers)
+ml_layer/
+lambda_bundle_build/
+lambda_bundle_build_arm64/
+receiver_bundle/
+
+lambda_bundle*.zip
+receiver_bundle*.zip
+reconciler_layer.zip
